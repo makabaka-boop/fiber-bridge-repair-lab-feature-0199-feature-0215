@@ -11,6 +11,8 @@ export const MAX_LINKS = 400_000;
 export const MIN_SITES = 2;
 /** 批量方案筛选：单次导入的端点对数量上限 */
 export const MAX_BATCH_PAIRS = 100_000;
+/** 有序备纤计划：单次导入的端点对数量上限 */
+export const MAX_PLAN_ITEMS = 100_000;
 
 /**
  * 将一个 JSON 值规范化为非空字符串编号。
@@ -148,14 +150,14 @@ function normalizeBatchEndpoint(value: unknown, label: string): string {
 }
 
 /**
- * 解析批量方案筛选输入：一个 1–100000 项的 JSON 数组，每项为**仅含**
- * "a"、"b" 两个字段的对象（端点编号沿用单次试接规则）。
+ * 解析“端点对数组”输入（批量方案筛选与有序备纤计划共用同一契约）：
+ * 一个 1–maxItems 项的 JSON 数组，每项为**仅含** "a"、"b" 两个字段的对象
+ * （端点编号沿用单次试接规则）。
  *
- * 仅做结构与字段校验；端点存在性、互异性由 Analyzer.screenBatch
- * 针对当前拓扑校验。空批次、额外字段、超限、任一项非法均整体拒绝，
- * 错误消息携带输入下标（0 起）。
+ * 仅做结构与字段校验；端点存在性、互异性由 Analyzer 针对当前拓扑校验。
+ * 空批次、额外字段、超限、任一项非法均整体拒绝，错误消息携带输入下标（0 起）。
  */
-export function parseBatchPlans(jsonText: string): BatchPair[] {
+function parsePairArray(jsonText: string, label: string, maxItems: number): BatchPair[] {
   let raw: unknown;
   try {
     raw = JSON.parse(jsonText);
@@ -163,18 +165,18 @@ export function parseBatchPlans(jsonText: string): BatchPair[] {
     throw new TopologyError(`JSON 语法错误：${(e as Error).message}`);
   }
   if (!Array.isArray(raw)) {
-    throw new TopologyError('批量方案必须是一个 JSON 数组，形如 [{"a": "站点1", "b": "站点2"}, ...]');
+    throw new TopologyError(`${label}必须是一个 JSON 数组，形如 [{"a": "站点1", "b": "站点2"}, ...]`);
   }
   if (raw.length === 0) {
-    throw new TopologyError('批量方案不能为空数组：至少包含 1 项端点对');
+    throw new TopologyError(`${label}不能为空数组：至少包含 1 项端点对`);
   }
-  if (raw.length > MAX_BATCH_PAIRS) {
-    throw new TopologyError(`批量方案项数超过上限 ${MAX_BATCH_PAIRS}，当前为 ${raw.length}`);
+  if (raw.length > maxItems) {
+    throw new TopologyError(`${label}项数超过上限 ${maxItems}，当前为 ${raw.length}`);
   }
 
   const pairs: BatchPair[] = new Array(raw.length);
   for (let i = 0; i < raw.length; i++) {
-    const where = `批量方案下标 ${i}`;
+    const where = `${label}下标 ${i}`;
     const entry = raw[i];
     if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
       throw new TopologyError(`${where}：每项必须是仅含 "a"、"b" 两个字段的对象`);
@@ -192,6 +194,22 @@ export function parseBatchPlans(jsonText: string): BatchPair[] {
     };
   }
   return pairs;
+}
+
+/**
+ * 解析批量方案筛选输入：一个 1–100000 项的 JSON 数组，每项为**仅含**
+ * "a"、"b" 两个字段的对象（端点编号沿用单次试接规则）。
+ */
+export function parseBatchPlans(jsonText: string): BatchPair[] {
+  return parsePairArray(jsonText, '批量方案', MAX_BATCH_PAIRS);
+}
+
+/**
+ * 解析有序备纤计划输入：与批量方案同一契约（1–100000 项、每项仅含
+ * "a"、"b"），但语义不同——数组顺序即敷设顺序，复核时按序归属基线桥。
+ */
+export function parsePlanItems(jsonText: string): BatchPair[] {
+  return parsePairArray(jsonText, '备纤计划', MAX_PLAN_ITEMS);
 }
 
 /** 连通性检查（显式栈迭代，避免深递归） */

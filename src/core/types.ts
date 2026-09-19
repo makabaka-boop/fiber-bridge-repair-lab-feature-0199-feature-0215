@@ -72,6 +72,36 @@ export interface BatchScreenResult {
   baselineCount: number;
 }
 
+/**
+ * 有序备纤计划中的一步：与输入下标一一对应。
+ * 同一座基线桥只归属于最早覆盖它的步骤，因此后续步骤（重复、反向、
+ * 交叠或被包含的路径）的首次消除清单可以为空、边际数为零。
+ */
+export interface PlanStepItem {
+  /** 输入下标（0 起） */
+  index: number;
+  a: string;
+  b: string;
+  /** 本步首次消除的基线桥清单（按链路编号 UTF-8 字节序；各步互斥） */
+  firstCovered: BridgeInfo[];
+  /** 边际数：本步首次归属的基线桥数量 */
+  marginal: number;
+  /** 累计数：截至本步累计归属的基线桥数量 */
+  cumulative: number;
+  /** 剩余数：本步之后仍未被计划覆盖的基线桥数量 */
+  remaining: number;
+}
+
+/** 有序备纤计划整体复核结果：全批校验通过后一次性生成并原子替换 */
+export interface PlanReviewResult {
+  /** 按输入下标排列，长度与输入一致 */
+  steps: PlanStepItem[];
+  /** 生成结果时的基线脆弱链路总数（快照，便于核对） */
+  baselineCount: number;
+  /** 计划覆盖的基线桥总数（各步清单之并的大小，等于末步累计） */
+  coveredCount: number;
+}
+
 /** 试接一条虚拟备纤后的结论 */
 export interface TrialResult {
   a: string;

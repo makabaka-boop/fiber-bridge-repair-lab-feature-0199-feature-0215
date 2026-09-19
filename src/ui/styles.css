@@ -361,6 +361,29 @@ button.link {
   font-size: 13.5px;
 }
 
+.chip-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  max-height: 96px;
+  overflow: auto;
+  max-width: 420px;
+}
+
+.chip {
+  background: #0c1422;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 1px 8px;
+  font-size: 12px;
+  color: #bcd6ff;
+  white-space: nowrap;
+}
+
+.plan-table td {
+  vertical-align: top;
+}
+
 h3.still {
   color: var(--warn);
 }

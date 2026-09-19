@@ -1,8 +1,14 @@
 import { useCallback, useMemo, useState } from 'react';
 import { Analyzer } from '../core/analysis';
-import { parseBatchPlans, parseTopology } from '../core/parse';
+import { parseBatchPlans, parsePlanItems, parseTopology } from '../core/parse';
 import { TopologyError } from '../core/types';
-import type { BaselineResult, BatchScreenResult, NormalizedTopology, TrialResult } from '../core/types';
+import type {
+  BaselineResult,
+  BatchScreenResult,
+  NormalizedTopology,
+  PlanReviewResult,
+  TrialResult,
+} from '../core/types';
 import { sampleTopology } from './sample';
 import { BridgeTable, Pagination, usePagination } from './BridgeTable';
 
@@ -28,6 +34,12 @@ interface BatchState {
   error: string | null;
 }
 
+interface PlanState {
+  /** 上次成功的有序备纤计划复核结果；非法计划导入时保留不变 */
+  result: PlanReviewResult | null;
+  error: string | null;
+}
+
 export function App() {
   const [valid, setValid] = useState<ValidState | null>(null);
   const [rawText, setRawText] = useState('');
@@ -37,6 +49,7 @@ export function App() {
 
   const [trial, setTrial] = useState<TrialState | null>(null);
   const [batch, setBatch] = useState<BatchState | null>(null);
+  const [plan, setPlan] = useState<PlanState | null>(null);
 
   const loadTopology = useCallback((text: string, label: string | null) => {
     setImporting(true);
@@ -53,9 +66,10 @@ export function App() {
         });
         setImportError(null);
         setFileName(label);
-        // 新拓扑导入后旧试接与旧批量结果不再适用，清空（基线本身不受历史操作影响）
+        // 新拓扑导入后旧试接、旧批量与旧计划结果不再适用，清空（基线本身不受历史操作影响）
         setTrial(null);
         setBatch(null);
+        setPlan(null);
       } catch (e) {
         const msg = e instanceof TopologyError ? e.message : `分析失败：${(e as Error).message}`;
         setImportError(msg); // 保留 valid（上次有效拓扑）与既有试接/批量结果不变
@@ -108,6 +122,21 @@ export function App() {
       const msg = e instanceof TopologyError ? e.message : `批量筛选失败：${(e as Error).message}`;
       // 非法批量导入：保留上次批量结果（若有），仅更新错误
       setBatch((prev) => ({ result: prev?.result ?? null, error: msg }));
+    }
+  };
+
+  const onPlan = (text: string) => {
+    if (!valid) return;
+    try {
+      // 全批校验（结构/字段 → 端点存在且互异）全部通过后才计算归属
+      const pairs = parsePlanItems(text);
+      const result = valid.analyzer.reviewPlan(pairs);
+      // 计算完成才原子替换上次计划结果；基线、单次试接与批量结果不受影响
+      setPlan({ result, error: null });
+    } catch (e) {
+      const msg = e instanceof TopologyError ? e.message : `计划复核失败：${(e as Error).message}`;
+      // 非法计划导入：保留上次计划结果（若有），仅更新错误
+      setPlan((prev) => ({ result: prev?.result ?? null, error: msg }));
     }
   };
 
@@ -189,6 +218,11 @@ export function App() {
             batch={batch}
             onSubmit={onBatch}
             onDismissError={() => setBatch((p) => (p ? { ...p, error: null } : p))}
+          />
+          <PlanSection
+            plan={plan}
+            onSubmit={onPlan}
+            onDismissError={() => setPlan((p) => (p ? { ...p, error: null } : p))}
           />
         </>
       )}
@@ -432,6 +466,115 @@ function BatchSection({
             </table>
           </div>
           <Pagination page={page} total={result.items.length} />
+        </div>
+      )}
+    </section>
+  );
+}
+
+function PlanSection({
+  plan,
+  onSubmit,
+  onDismissError,
+}: {
+  plan: PlanState | null;
+  onSubmit: (text: string) => void;
+  onDismissError: () => void;
+}) {
+  // 计划草稿独立保存：与批量筛选的输入互不影响，非法提交后草稿也不丢失
+  const [text, setText] = useState('');
+
+  // 仅当存在成功复核结果时展示；非法计划导入时 result 保持为上次结果
+  const result = plan?.result ?? null;
+  const page = usePagination(result?.steps.length ?? 0, 'plan');
+  const slice = useMemo(
+    () => result?.steps.slice(page.start, page.end) ?? [],
+    [result, page.start, page.end],
+  );
+
+  return (
+    <section className="card">
+      <h2>5. 有序备纤计划复核</h2>
+      <p className="hint">
+        粘贴 1–100000 项的 JSON 数组，每项仅含 <code>{'{"a": "站点1", "b": "站点2"}'}</code> 两个字段，
+        <strong>数组顺序即敷设顺序</strong>。每步给出端点对、本步<strong>首次消除</strong>的基线脆弱链路清单
+        （按链路编号 UTF-8 字节序）、边际数、累计数与剩余数；同一座桥只归最早覆盖的步骤，
+        重复、反向、交叠或被包含路径的后续步骤可为零。任一项非法则整批拒绝并保留上次结果。
+      </p>
+      <textarea
+        className="json-input"
+        aria-label="备纤计划 JSON 输入"
+        rows={5}
+        placeholder='[{"a":"a","b":"c"}, {"a":"b","b":"c"}]'
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        spellCheck={false}
+      />
+      <div className="row">
+        <button className="primary" onClick={() => onSubmit(text)}>
+          复核计划
+        </button>
+      </div>
+
+      {plan?.error && (
+        <div className="alert error" role="alert">
+          <strong>计划导入被拒绝。</strong> {result ? '上次计划结果保留如下。' : '尚无有效计划结果。'}
+          <div className="alert-detail">{plan.error}</div>
+          <button className="link" onClick={onDismissError}>
+            关闭提示
+          </button>
+        </div>
+      )}
+
+      {result && (
+        <div className="plan-result">
+          <div className="stat-row">
+            <Stat label="计划步数" value={result.steps.length} />
+            <Stat label="基线脆弱链路总数" value={result.baselineCount} />
+            <Stat label="计划覆盖总数" value={result.coveredCount} />
+            <Stat label="剩余未覆盖" value={result.baselineCount - result.coveredCount} />
+          </div>
+          <div className="table-wrap">
+            <table className="bridge-table plan-table">
+              <thead>
+                <tr>
+                  <th className="col-rank">下标</th>
+                  <th className="col-endpoint">端点 A</th>
+                  <th className="col-endpoint">端点 B</th>
+                  <th>本步首次消除的基线脆弱链路（UTF-8 字节序）</th>
+                  <th className="col-side">边际数</th>
+                  <th className="col-side">累计数</th>
+                  <th className="col-side">剩余数</th>
+                </tr>
+              </thead>
+              <tbody>
+                {slice.map((step) => (
+                  <tr key={step.index}>
+                    <td className="muted">{step.index}</td>
+                    <td className="mono">{step.a}</td>
+                    <td className="mono">{step.b}</td>
+                    <td>
+                      {step.firstCovered.length === 0 ? (
+                        <span className="muted">—（本步无新增覆盖）</span>
+                      ) : (
+                        <div className="chip-list">
+                          {step.firstCovered.map((b) => (
+                            <span key={b.id} className="chip mono" title={`${b.u} – ${b.v}`}>
+                              {b.id}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                    </td>
+                    <td className="num strong">{step.marginal.toLocaleString('zh-CN')}</td>
+                    <td className="num">{step.cumulative.toLocaleString('zh-CN')}</td>
+                    <td className="num">{step.remaining.toLocaleString('zh-CN')}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <Pagination page={page} total={result.steps.length} />
         </div>
       )}
     </section>

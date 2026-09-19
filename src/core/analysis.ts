@@ -13,7 +13,7 @@
  * Tarjan；试接在其结果上以独立缓冲派生，绝不改写基线。
  */
 import { compareUtf8 } from './utf8';
-import { MAX_BATCH_PAIRS } from './parse';
+import { MAX_BATCH_PAIRS, MAX_PLAN_ITEMS } from './parse';
 import { TopologyError } from './types';
 import type {
   BaselineResult,
@@ -22,6 +22,8 @@ import type {
   BatchScreenResult,
   BridgeInfo,
   NormalizedTopology,
+  PlanReviewResult,
+  PlanStepItem,
   TrialResult,
 } from './types';
 
@@ -239,6 +241,8 @@ export class Analyzer {
   private readonly tj: TarjanOutput;
   /** 只读批量索引（桥前缀 + 二进制提升表），构造时一次建成 */
   private readonly lca: LcaIndex;
+  /** 链路下标 → 基线桥清单中的位置（非桥为 -1），供有序计划回查 BridgeInfo */
+  private readonly bridgePos: Int32Array;
   readonly baseline: BaselineResult;
 
   constructor(private readonly t: NormalizedTopology) {
@@ -246,6 +250,14 @@ export class Analyzer {
     this.tj = tarjanBridges(this.g, t.links.length);
     this.lca = buildLcaIndex(this.g, this.tj);
     this.baseline = this.buildBaseline();
+    this.bridgePos = new Int32Array(t.links.length).fill(-1);
+    const posById = new Map<string, number>();
+    this.baseline.bridges.forEach((b, i) => posById.set(b.id, i));
+    for (let e = 0; e < t.links.length; e++) {
+      if (this.tj.isBridge[e]) {
+        this.bridgePos[e] = posById.get(this.g.linkIdByIndex[e])!;
+      }
+    }
   }
 
   private buildBaseline(): BaselineResult {
@@ -320,6 +332,39 @@ export class Analyzer {
   }
 
   /**
+   * 端点对数组的全批校验（批量筛选与有序备纤计划共用）：
+   * 数量 1–maxItems、每项端点存在且互异；任一项非法即按下标（0 起）
+   * 抛出 TopologyError、不产生任何部分结果。全部通过后返回端点下标数组。
+   */
+  private validatePairs(pairs: BatchPair[], label: string, maxItems: number): { va: Int32Array; vb: Int32Array } {
+    const count = pairs.length;
+    if (count === 0) {
+      throw new TopologyError(`${label}不能为空：至少包含 1 项端点对`);
+    }
+    if (count > maxItems) {
+      throw new TopologyError(`${label}项数超过上限 ${maxItems}，当前为 ${count}`);
+    }
+
+    const va = new Int32Array(count);
+    const vb = new Int32Array(count);
+    for (let i = 0; i < count; i++) {
+      const { a, b } = pairs[i];
+      if (a === b) {
+        throw new TopologyError(`${label}下标 ${i}：两个端点必须不同（均为 ${JSON.stringify(a)}），不得构成自环`);
+      }
+      const ia = this.g.siteIndex.get(a);
+      const ib = this.g.siteIndex.get(b);
+      if (ia === undefined || ib === undefined) {
+        const missing = ia === undefined ? a : b;
+        throw new TopologyError(`${label}下标 ${i}：端点 ${JSON.stringify(missing)} 不在当前站点清单中`);
+      }
+      va[i] = ia;
+      vb[i] = ib;
+    }
+    return { va, vb };
+  }
+
+  /**
    * 批量方案筛选：对整批端点对给出各自可消除的基线桥数量（不展开链路清单）。
    *
    * 全批校验（端点存在且互异）全部通过后才开始计数，任一非法即按下标
@@ -330,33 +375,10 @@ export class Analyzer {
    * 不扫描全部链路，每项 O(log n)。
    */
   screenBatch(pairs: BatchPair[]): BatchScreenResult {
+    const { va, vb } = this.validatePairs(pairs, '批量方案', MAX_BATCH_PAIRS);
     const count = pairs.length;
-    if (count === 0) {
-      throw new TopologyError('批量方案不能为空：至少包含 1 项端点对');
-    }
-    if (count > MAX_BATCH_PAIRS) {
-      throw new TopologyError(`批量方案项数超过上限 ${MAX_BATCH_PAIRS}，当前为 ${count}`);
-    }
 
-    // 第一遍：全批校验并解析端点下标；任何一项非法都按下标报错
-    const va = new Int32Array(count);
-    const vb = new Int32Array(count);
-    for (let i = 0; i < count; i++) {
-      const { a, b } = pairs[i];
-      if (a === b) {
-        throw new TopologyError(`批量方案下标 ${i}：两个端点必须不同（均为 ${JSON.stringify(a)}），不得构成自环`);
-      }
-      const ia = this.g.siteIndex.get(a);
-      const ib = this.g.siteIndex.get(b);
-      if (ia === undefined || ib === undefined) {
-        const missing = ia === undefined ? a : b;
-        throw new TopologyError(`批量方案下标 ${i}：端点 ${JSON.stringify(missing)} 不在当前站点清单中`);
-      }
-      va[i] = ia;
-      vb[i] = ib;
-    }
-
-    // 第二遍：校验全部通过后，基于只读索引批量计数（重复候选按原序保留）
+    // 校验全部通过后，基于只读索引批量计数（重复候选按原序保留）
     const { bridgePrefix } = this.lca;
     const items: BatchScreenItem[] = new Array(count);
     for (let i = 0; i < count; i++) {
@@ -371,6 +393,87 @@ export class Analyzer {
       };
     }
     return { items, baselineCount: this.baseline.bridges.length };
+  }
+
+  /**
+   * 有序备纤计划复核：按输入顺序逐步敷设，给出每步**首次归属**的基线桥
+   * 清单、边际数、累计数与剩余数。同一座基线桥只归属于最早覆盖它的步骤，
+   * 因此重复、反向、交叠或被包含路径的后续步骤边际数可为零；各步清单
+   * 互斥，其并集恰为整个计划覆盖的基线桥。
+   *
+   * 实现：全批校验（与批量筛选同一契约）全部通过后才开始归属。复用
+   * Tarjan 父树与只读 LCA 索引，并用一个“向父级跳转”的并查集维护尚未
+   * 归属的桥边——find(v) 返回 v 沿已归属/非桥边压缩后最近的、父边仍是
+   * 未归属桥的祖先（或根）：
+   *  - 非桥树边在开工前预先并入父级（预先跳过，永不落步）；
+   *  - 每步从路径两端分别向上跳至 LCA，途经的未归属桥边首次归属本步，
+   *    归属后立即把该顶点并到父级（路径压缩），后续步骤自动跳过；
+   *  - 不逐步调用 trial、不按路径逐边扫描：每条桥边全程只归属一次，
+   *    总代价 O((n + Σ步路径首次覆盖数)·α(n) + 步数·log n)。
+   *
+   * 全部计算完成后才组装并返回整体结果（调用方原子替换展示）；并查集
+   * 为本次调用独立缓冲，绝不触碰基线、单次试接或批量筛选的任何数据。
+   */
+  reviewPlan(pairs: BatchPair[]): PlanReviewResult {
+    const { va, vb } = this.validatePairs(pairs, '备纤计划', MAX_PLAN_ITEMS);
+    const count = pairs.length;
+
+    const n = this.g.n;
+    const { parentVertex, parentEdge, depth } = this.g;
+    const { isBridge, order } = this.tj;
+    const baselineCount = this.baseline.bridges.length;
+
+    // 并查集：dsu[v] 初始指向自身；find 带路径压缩（迭代实现）
+    const dsu = new Int32Array(n);
+    for (let v = 0; v < n; v++) dsu[v] = v;
+    const find = (x: number): number => {
+      let r = x;
+      while (dsu[r] !== r) r = dsu[r];
+      while (dsu[x] !== r) {
+        const p = dsu[x];
+        dsu[x] = r;
+        x = p;
+      }
+      return r;
+    };
+    // 非桥树边预先跳过：按 DFS 发现序（父先于子）把非桥边顶点并入父级
+    for (let i = 0; i < n; i++) {
+      const v = order[i];
+      const e = parentEdge[v];
+      if (e !== -1 && !isBridge[e]) dsu[v] = find(parentVertex[v]);
+    }
+
+    const steps: PlanStepItem[] = new Array(count);
+    let cumulative = 0;
+    for (let i = 0; i < count; i++) {
+      const w = lcaOf(this.lca, va[i], vb[i]);
+      // 本步首次归属的桥（链路下标）；从路径两端分别向 LCA 跳转收集
+      const collected: number[] = [];
+      for (const start of [va[i], vb[i]]) {
+        let v = find(start);
+        while (depth[v] > depth[w]) {
+          // 不变式：v 非根且 parentEdge[v] 是尚未归属的桥
+          collected.push(parentEdge[v]);
+          // 首次归属后立即压缩到父级，同一桥不再归属后续步骤
+          dsu[v] = find(parentVertex[v]);
+          v = dsu[v];
+        }
+      }
+
+      const firstCovered: BridgeInfo[] = collected.map((e) => this.baseline.bridges[this.bridgePos[e]]);
+      firstCovered.sort((x, y) => compareUtf8(x.id, y.id));
+      cumulative += firstCovered.length;
+      steps[i] = {
+        index: i,
+        a: pairs[i].a,
+        b: pairs[i].b,
+        firstCovered,
+        marginal: firstCovered.length,
+        cumulative,
+        remaining: baselineCount - cumulative,
+      };
+    }
+    return { steps, baselineCount, coveredCount: cumulative };
   }
 }
 
