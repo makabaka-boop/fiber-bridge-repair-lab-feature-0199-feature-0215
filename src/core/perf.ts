@@ -5,10 +5,14 @@
  *
  * 第二段：200000 站点纯长链 + 100000 组批量方案查询，断言分析器构建
  * （含只读 LCA 索引）与整批查询合计 < 5000ms，且每项计数等于站点距离。
+ *
+ * 第三段：200000 站点纯长链的有序备纤计划——首步全覆盖后再跟 99999 条
+ * 子路径，断言仅首步有收益、后续边际均为 0，分析器构建与整批复核
+ * 合计 < 5000ms（并查集向父级跳转，全覆盖后每步 O(α(n))）。
  */
 import { parseTopology } from './parse';
 import { Analyzer } from './analysis';
-import type { BatchPair, NormalizedTopology } from './types';
+import type { BatchPair, NormalizedTopology, OrderedPlanStep } from './types';
 
 function buildUpperBoundTopology(): string {
   const n = 200_000;
@@ -124,6 +128,78 @@ function benchBatch(): void {
     process.exit(1);
   }
   console.log(`OK：批量筛选在上限 ${budget}ms 预算内完成，${q} 项计数全部等于距离`);
+
+  benchOrderedPlan();
+}
+
+/**
+ * 有序备纤计划基准：200000 站点纯长链（199999 座桥）。
+ * 首步 (site-0, site-199999) 全覆盖；随后 99999 条子路径全部包含于
+ * 已覆盖区间，断言仅首步边际为 199999、后续 99999 步边际均为 0。
+ */
+function benchOrderedPlan(): void {
+  const n = 200_000;
+  const sites = new Array<string>(n);
+  for (let i = 0; i < n; i++) sites[i] = `site-${i}`;
+  const links: { id: string; u: string; v: string }[] = [];
+  for (let i = 1; i < n; i++) {
+    links.push({ id: `c-${i}`, u: sites[i - 1], v: sites[i] });
+  }
+
+  const b0 = performance.now();
+  const chainAnalyzer = new Analyzer(normalize(parseTopology(JSON.stringify({ sites, links }))));
+  const b1 = performance.now();
+
+  // 确定性 LCG 生成 99999 条真子路径（端点不同、跨度 >=1，全部落在链内）
+  let state = 0x85ebca6b;
+  const rand = (): number => {
+    state = (Math.imul(state, 1103515245) + 12345) >>> 0;
+    return state / 4294967296;
+  };
+  const subSteps: OrderedPlanStep[] = new Array(99_999);
+  for (let i = 0; i < subSteps.length; i++) {
+    const p = Math.floor(rand() * (n - 1));
+    const span = 1 + Math.floor(rand() * (n - 1 - p));
+    subSteps[i] = { a: sites[p], b: sites[p + span] };
+  }
+  const steps: OrderedPlanStep[] = [{ a: sites[0], b: sites[n - 1] }, ...subSteps];
+
+  const b2 = performance.now();
+  const result = chainAnalyzer.reviewOrderedPlan(steps);
+  const b3 = performance.now();
+
+  // 仅首步有收益：199999 座桥全部归首步；后续 99999 条子路径边际均为 0
+  if (result.items[0].marginal !== n - 1) {
+    console.error(`首步边际错误：期望 ${n - 1}，实际 ${result.items[0].marginal}`);
+    process.exit(1);
+  }
+  for (let i = 1; i < steps.length; i++) {
+    if (result.items[i].marginal !== 0) {
+      console.error(`下标 ${i} 应为零边际，实际 ${result.items[i].marginal}`);
+      process.exit(1);
+    }
+    if (result.items[i].cumulative !== n - 1 || result.items[i].remaining !== 0) {
+      console.error(`下标 ${i} 累计/剩余错误：${result.items[i].cumulative}/${result.items[i].remaining}`);
+      process.exit(1);
+    }
+  }
+  if (result.coveredCount !== n - 1 || result.baselineCount !== n - 1) {
+    console.error(`覆盖/基线计数错误：${result.coveredCount}/${result.baselineCount}`);
+    process.exit(1);
+  }
+
+  console.log(`—— 有序备纤计划复核（200000 站点长链 / ${steps.length} 步：首步全覆盖 + 99999 子路径）——`);
+  console.log(`解析+分析器构建(含LCA索引): ${ms(b0, b1)} ms`);
+  console.log(`生成计划: ${ms(b1, b2)} ms`);
+  console.log(`整批复核: ${ms(b2, b3)} ms`);
+  console.log(`分析器构建+整批复核合计: ${ms(b0, b3)} ms`);
+
+  const budget = 5000;
+  if (b3 - b0 > budget) {
+    console.error(`有序备纤计划复核超出 ${budget}ms 预算`);
+    process.exit(1);
+  }
+  console.log(`OK：有序备纤计划复核在 ${budget}ms 预算内完成，仅首步有收益、后续 99999 步均为零`);
 }
 
 main();

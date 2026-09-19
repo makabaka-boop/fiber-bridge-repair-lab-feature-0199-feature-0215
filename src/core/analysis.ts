@@ -13,7 +13,7 @@
  * Tarjan；试接在其结果上以独立缓冲派生，绝不改写基线。
  */
 import { compareUtf8 } from './utf8';
-import { MAX_BATCH_PAIRS } from './parse';
+import { MAX_BATCH_PAIRS, MAX_PLAN_STEPS } from './parse';
 import { TopologyError } from './types';
 import type {
   BaselineResult,
@@ -22,6 +22,9 @@ import type {
   BatchScreenResult,
   BridgeInfo,
   NormalizedTopology,
+  OrderedPlanItem,
+  OrderedPlanResult,
+  OrderedPlanStep,
   TrialResult,
 } from './types';
 
@@ -167,6 +170,10 @@ interface LcaIndex {
   /** 扁平二进制提升表：up[k * n + v] 为 v 的第 2^k 个祖先（根的祖先为其自身） */
   up: Int32Array;
   levels: number;
+  /** 全部桥的链路下标，按链路编号 UTF-8 字节序排列（基线与有序计划共享同一份次序） */
+  sortedBridgeEdges: Int32Array;
+  /** bridgeRank[e]：桥链路下标 e 在 UTF-8 字节序中的名次（非桥为 -1），供有序计划清单排序 */
+  bridgeRank: Int32Array;
 }
 
 /** 构建只读 LCA 索引：O(n log n)，全程迭代 */
@@ -185,7 +192,7 @@ function buildLcaIndex(g: PreparedGraph, tj: TarjanOutput): LcaIndex {
   }
 
   // 二进制提升：up[0][v] = 父顶点（根指向自身），up[k][v] = up[k-1][up[k-1][v]]
-  const levels = Math.max(1, 32 - Math.clz32(n - 1));
+  const levels = Math.max(1, 32 - Math.clz32(n));
   const up = new Int32Array(levels * n);
   for (let v = 0; v < n; v++) {
     const p = parentVertex[v];
@@ -198,7 +205,18 @@ function buildLcaIndex(g: PreparedGraph, tj: TarjanOutput): LcaIndex {
       up[cur + v] = up[prev + up[prev + v]];
     }
   }
-  return { depth, bridgePrefix, up, levels };
+
+  // 桥的字节序名次：收集桥链路下标后按编号排序，名次表供有序计划
+  // 各步清单以“按下标计数排序”代替逐次字符串比较排序
+  const m = g.linkIdByIndex.length;
+  const bridgeEdges: number[] = [];
+  for (let e = 0; e < m; e++) if (isBridge[e]) bridgeEdges.push(e);
+  bridgeEdges.sort((x, y) => compareUtf8(g.linkIdByIndex[x], g.linkIdByIndex[y]));
+  const sortedBridgeEdges = Int32Array.from(bridgeEdges);
+  const bridgeRank = new Int32Array(m).fill(-1);
+  for (let r = 0; r < bridgeEdges.length; r++) bridgeRank[bridgeEdges[r]] = r;
+
+  return { depth, bridgePrefix, up, levels, sortedBridgeEdges, bridgeRank };
 }
 
 /** 迭代式最近公共祖先（二进制提升），不占用递归调用栈 */
@@ -249,15 +267,15 @@ export class Analyzer {
   }
 
   private buildBaseline(): BaselineResult {
-    const { isBridge, bridgeChild, subtree } = this.tj;
-    const bridges: BridgeInfo[] = [];
-    for (let e = 0; e < this.t.links.length; e++) {
-      if (!isBridge[e]) continue;
+    const { bridgeChild, subtree } = this.tj;
+    const { sortedBridgeEdges } = this.lca;
+    const bridges: BridgeInfo[] = new Array(sortedBridgeEdges.length);
+    for (let r = 0; r < sortedBridgeEdges.length; r++) {
+      const e = sortedBridgeEdges[r];
       const link = this.t.links[e];
       const side = subtree[bridgeChild[e]];
-      bridges.push({ id: link.id, u: link.u, v: link.v, smallerSide: Math.min(side, this.g.n - side) });
+      bridges[r] = { id: link.id, u: link.u, v: link.v, smallerSide: Math.min(side, this.g.n - side) };
     }
-    bridges.sort((x, y) => compareUtf8(x.id, y.id));
     return { siteCount: this.g.n, linkCount: this.t.links.length, bridges };
   }
 
@@ -371,6 +389,140 @@ export class Analyzer {
       };
     }
     return { items, baselineCount: this.baseline.bridges.length };
+  }
+
+  /**
+   * 有序备纤计划复核：按计划顺序逐步“试接”，同一基线桥只归最早覆盖它的步骤。
+   *
+   * 全批校验（端点存在且互异）全部通过后才开始计算；任一步非法即按下标
+   * 抛出 TopologyError、不产生任何部分结果，也不改写基线、单次试接与批量筛选。
+   *
+   * 计算复用现有 DFS 父树与 LCA 索引，并维护一棵“向父级跳转”的并查集 dsu[v]：
+   *  - dsu[v] === v：父边 parentEdge[v] 是尚未归属的桥；
+   *  - 否则 dsu[v] 指向一个更高的祖先（父边为非桥，或桥已归更早步骤，或 v 为根）。
+   * 每步从路径两端分别向 LCA 跳转：find 命中自属顶点即把该桥首次归本步，
+   * 随后把 dsu[v] 压缩到父级（以后各步直接越过）；非桥树边在初始化时预先跳过。
+   * 既不逐步调用 trial，也不逐路径扫描全部链路。路径天然在 LCA 处停止，
+   * 不会越过 LCA 收集到计划外的桥。
+   *
+   * 计算全部完成后才一次性组装 OrderedPlanResult（原子替换由 UI 层负责），
+   * 各步清单互斥且并集恰为计划覆盖的基线桥。
+   */
+  reviewOrderedPlan(steps: OrderedPlanStep[]): OrderedPlanResult {
+    const count = steps.length;
+    if (count === 0) {
+      throw new TopologyError('有序备纤计划不能为空：至少包含 1 个步骤');
+    }
+    if (count > MAX_PLAN_STEPS) {
+      throw new TopologyError(`有序备纤计划步数超过上限 ${MAX_PLAN_STEPS}，当前为 ${count}`);
+    }
+
+    const { n, parentVertex, parentEdge, depth } = this.g;
+    const { bridgeRank } = this.lca;
+    const { isBridge } = this.tj;
+
+    // 第一遍：全批校验并解析端点下标；任一步非法都按下标报错，不产生部分结果
+    const va = new Int32Array(count);
+    const vb = new Int32Array(count);
+    for (let i = 0; i < count; i++) {
+      const { a, b } = steps[i];
+      if (a === b) {
+        throw new TopologyError(`有序备纤计划下标 ${i}：两个端点必须不同（均为 ${JSON.stringify(a)}），不得构成自环`);
+      }
+      const ia = this.g.siteIndex.get(a);
+      const ib = this.g.siteIndex.get(b);
+      if (ia === undefined || ib === undefined) {
+        const missing = ia === undefined ? a : b;
+        throw new TopologyError(`有序备纤计划下标 ${i}：端点 ${JSON.stringify(missing)} 不在当前站点清单中`);
+      }
+      va[i] = ia;
+      vb[i] = ib;
+    }
+
+    // 第二遍：校验全部通过后，初始化“向父级跳转”的并查集。
+    // 根指向自身；非桥树边的子顶点预先指向父顶点（find 时直接越过）；
+    // 桥的子顶点自属，等待首次归属。
+    const dsu = new Int32Array(n);
+    for (let v = 0; v < n; v++) {
+      const p = parentVertex[v];
+      dsu[v] = p === -1 || isBridge[parentEdge[v]] ? v : p;
+    }
+
+    // claimedEdges[i] 为本步首次归属的桥链路下标（已按字节序名次排好）
+    const claimed: number[][] = new Array(count);
+    const marginal = new Int32Array(count);
+    let covered = 0;
+
+    // 迭代式 find（带路径压缩）就地内联在两处爬升循环中，避免闭包调用开销
+    for (let i = 0; i < count; i++) {
+      const w = lcaOf(this.lca, va[i], vb[i]);
+      const list: number[] = [];
+
+      // 从一端向 LCA 跳转：find 落在 LCA 之下才处理其自属（尚未归属的）父边桥
+      let x = va[i];
+      while (depth[x] > depth[w]) {
+        // find(x)：先上溯到自属根，再原路压缩
+        let root = x;
+        while (dsu[root] !== root) root = dsu[root];
+        while (dsu[x] !== x) {
+          const next = dsu[x];
+          dsu[x] = root;
+          x = next;
+        }
+        x = root;
+        if (depth[x] <= depth[w]) break;
+        list.push(parentEdge[x]); // find 自属 ⇒ 父边必为尚未归属的桥
+        const px = parentVertex[x];
+        dsu[x] = px; // 首次归属后压缩到父级，后续步骤直接越过
+        x = px;
+      }
+      // 另一端同样处理（LCA 自身的父边不在 a↔b 路径上，depth 判定天然排除）
+      let y = vb[i];
+      while (depth[y] > depth[w]) {
+        let root = y;
+        while (dsu[root] !== root) root = dsu[root];
+        while (dsu[y] !== y) {
+          const next = dsu[y];
+          dsu[y] = root;
+          y = next;
+        }
+        y = root;
+        if (depth[y] <= depth[w]) break;
+        list.push(parentEdge[y]);
+        const py = parentVertex[y];
+        dsu[y] = py;
+        y = py;
+      }
+
+      list.sort((p, q) => bridgeRank[p] - bridgeRank[q]);
+      claimed[i] = list;
+      marginal[i] = list.length;
+      covered += list.length;
+    }
+
+    // 第三遍：全部计算完成后一次性组装结果（成功路径才走到这里，保证“原子替换”）
+    const baseline = this.baseline.bridges;
+    const items: OrderedPlanItem[] = new Array(count);
+    let cumulative = 0;
+    for (let i = 0; i < count; i++) {
+      const edges = claimed[i];
+      const firstRemoved: BridgeInfo[] = new Array(edges.length);
+      for (let k = 0; k < edges.length; k++) {
+        // baseline 已按字节序排列；bridgeRank 与之同序，可直接索引
+        firstRemoved[k] = baseline[bridgeRank[edges[k]]];
+      }
+      cumulative += marginal[i];
+      items[i] = {
+        index: i,
+        a: steps[i].a,
+        b: steps[i].b,
+        firstRemoved,
+        marginal: marginal[i],
+        cumulative,
+        remaining: baseline.length - cumulative,
+      };
+    }
+    return { items, baselineCount: baseline.length, coveredCount: covered };
   }
 }
 

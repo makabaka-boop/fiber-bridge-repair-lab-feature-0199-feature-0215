@@ -17,6 +17,8 @@ const importButton = () => screen.getByRole('button', { name: '导入并分析' 
 const trialButton = () => screen.getByRole('button', { name: '试接并核对' });
 const batchBox = () => screen.getByLabelText('批量方案 JSON 输入') as HTMLTextAreaElement;
 const batchButton = () => screen.getByRole('button', { name: '批量筛选' });
+const planBox = () => screen.getByLabelText('有序备纤计划 JSON 输入') as HTMLTextAreaElement;
+const planButton = () => screen.getByRole('button', { name: '按序复核' });
 
 /** 读取“脆弱链路总数”统计卡数值（该卡始终随基线渲染，非法导入后也保留） */
 const fragileStatValue = () => {
@@ -37,6 +39,15 @@ const batchRows = () =>
   Array.from(document.querySelectorAll('.batch-table tbody tr')).map((tr) =>
     Array.from(tr.querySelectorAll('td')).map((td) => td.textContent),
   );
+
+/** 当前有序计划结果表的步骤行（步骤、A、B、桥清单单元、边际、累计、剩余） */
+const planRows = () =>
+  Array.from(document.querySelectorAll('.plan-table tbody tr')).map((tr) =>
+    Array.from(tr.querySelectorAll('td')).map((td) => td.textContent),
+  );
+
+/** 读取有序计划结果区指定统计卡数值 */
+const planStatValue = (label: string) => batchStatValue(label);
 
 async function importJson(text: string) {
   fireEvent.change(inputBox(), { target: { value: text } });
@@ -60,6 +71,12 @@ async function submitBatch(text: string) {
   fireEvent.change(batchBox(), { target: { value: text } });
   await waitFor(() => expect(batchBox().value).toBe(text));
   fireEvent.click(batchButton());
+}
+
+async function submitPlan(text: string) {
+  fireEvent.change(planBox(), { target: { value: text } });
+  await waitFor(() => expect(planBox().value).toBe(text));
+  fireEvent.click(planButton());
 }
 
 afterEach(cleanup);
@@ -256,5 +273,143 @@ describe('批量方案筛选 UI', () => {
     expect(batchRows()[0]).toEqual(['50', 'a', 'c', '2']);
     expect(batchRows()[9]).toEqual(['59', 'a', 'b', '1']);
     expect(within(batchSection).getByText(/共 60 条/)).toBeTruthy();
+  });
+});
+
+describe('有序备纤计划复核 UI', () => {
+  it('按序显示端点对/首次消除清单/边际/累计/剩余；重复反向交叠包含步骤后续为零', async () => {
+    render(<App />);
+    await importJson(validJson);
+    await waitFor(() => expect(fragileStatValue()).toBe('2'));
+
+    // a-c 先覆盖 L1,L2；随后反向、重复、包含路径均为 0
+    await submitPlan('[{"a":"a","b":"c"},{"a":"c","b":"a"},{"a":"a","b":"c"},{"a":"a","b":"b"},{"a":"b","b":"c"}]');
+    await waitFor(() => expect(planStatValue('计划步骤总数')).toBe('5'));
+    expect(planStatValue('计划覆盖基线桥')).toBe('2');
+    expect(planStatValue('零边际步骤数')).toBe('4');
+    expect(planStatValue('计划后仍剩余')).toBe('0');
+
+    const rows = planRows();
+    expect(rows).toHaveLength(5);
+    // 步骤 0：清单预览含 L1、L2（字节序），边际 2，累计 2，剩余 0
+    expect(rows[0][0]).toBe('0');
+    expect(rows[0][1]).toBe('a');
+    expect(rows[0][2]).toBe('c');
+    expect(rows[0][3]).toContain('L1');
+    expect(rows[0][3]).toContain('L2');
+    expect(rows[0][4]).toBe('2');
+    expect(rows[0][5]).toBe('2');
+    expect(rows[0][6]).toBe('0');
+    // 反向 / 重复 / 包含路径：无（0），边际 0，累计保持 2
+    for (const i of [1, 2, 3, 4]) {
+      expect(rows[i][3]).toContain('无（0）');
+      expect(rows[i][4]).toBe('0');
+      expect(rows[i][5]).toBe('2');
+      expect(rows[i][6]).toBe('0');
+    }
+
+    // 展开/收起本步清单
+    fireEvent.click(screen.getByRole('button', { name: '展开清单（2）' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: '收起清单' })).toBeTruthy());
+    fireEvent.click(screen.getByRole('button', { name: '收起清单' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: '展开清单（2）' })).toBeTruthy());
+  });
+
+  it('末项非法按下标整批拒绝并保留上次成功结果；空数组/额外字段/自环同样拒绝', async () => {
+    render(<App />);
+    await importJson(validJson);
+    await waitFor(() => expect(fragileStatValue()).toBe('2'));
+
+    await submitPlan('[{"a":"a","b":"c"}]');
+    await waitFor(() => expect(planRows()).toHaveLength(1));
+
+    // 末项非法（端点不存在）：按下标报错，上次结果完整保留
+    await submitPlan('[{"a":"a","b":"c"},{"a":"a","b":"ghost"}]');
+    await waitFor(() => expect(screen.getByText('有序备纤计划被拒绝。')).toBeTruthy());
+    expect(screen.getByText(/下标 1/)).toBeTruthy();
+    expect(screen.getByText(/不在当前站点清单/)).toBeTruthy();
+    expect(planRows()).toHaveLength(1);
+
+    await submitPlan('[]');
+    await waitFor(() => expect(screen.getByText(/空数组/)).toBeTruthy());
+    expect(planRows()).toHaveLength(1);
+
+    await submitPlan('[{"a":"a","b":"c","x":1}]');
+    await waitFor(() => expect(screen.getByText(/额外字段/)).toBeTruthy());
+    expect(planRows()).toHaveLength(1);
+
+    await submitPlan('[{"a":"a","b":"a"}]');
+    await waitFor(() => expect(screen.getByText(/下标 0.*必须不同/)).toBeTruthy());
+    expect(planRows()).toHaveLength(1);
+
+    // 草稿文本与基线、单次试接、批量筛选互不影响
+    await submitTrial('a', 'c');
+    await waitFor(() => expect(screen.getByText(/已消除 2 条/)).toBeTruthy());
+    await submitBatch('[{"a":"a","b":"c"}]');
+    await waitFor(() => expect(batchRows()).toHaveLength(1));
+    expect(planRows()).toHaveLength(1);
+  });
+
+  it('合法新拓扑清空计划结果；非法导入继续保留', async () => {
+    render(<App />);
+    await importJson(validJson);
+    await waitFor(() => expect(fragileStatValue()).toBe('2'));
+    await submitPlan('[{"a":"a","b":"c"}]');
+    await waitFor(() => expect(planRows()).toHaveLength(1));
+
+    // 合法新拓扑（三角形，无桥）：旧计划结果清空
+    await importJson(
+      JSON.stringify({
+        sites: ['x', 'y', 'z'],
+        links: [
+          { id: 'r1', u: 'x', v: 'y' },
+          { id: 'r2', u: 'y', v: 'z' },
+          { id: 'r3', u: 'z', v: 'x' },
+        ],
+      }),
+    );
+    await waitFor(() => expect(fragileStatValue()).toBe('0'));
+    expect(document.querySelector('.plan-table')).toBeNull();
+
+    // 新拓扑上复核：边际 0、剩余 0
+    await submitPlan('[{"a":"x","b":"z"}]');
+    await waitFor(() => expect(planRows()).toHaveLength(1));
+    expect(planRows()[0][3]).toContain('无（0）');
+    expect(planRows()[0][4]).toBe('0');
+
+    // 非法导入：当前拓扑与计划结果继续保留
+    await importJson('{坏的');
+    await waitFor(() => expect(screen.getByText('导入被拒绝，')).toBeTruthy());
+    expect(planRows()).toHaveLength(1);
+  });
+
+  it('计划步骤分页显示，且不影响批量筛选结果', async () => {
+    render(<App />);
+    await importJson(validJson);
+    await waitFor(() => expect(fragileStatValue()).toBe('2'));
+
+    const steps = Array.from({ length: 60 }, (_, i) => (i % 2 === 0 ? { a: 'a', b: 'c' } : { a: 'a', b: 'b' }));
+    await submitPlan(JSON.stringify(steps));
+    await waitFor(() => expect(planStatValue('计划步骤总数')).toBe('60'));
+
+    expect(planRows()).toHaveLength(50);
+    expect(planRows()[0][0]).toBe('0');
+    expect(planRows()[0][4]).toBe('2'); // 首步边际 2
+    expect(planRows()[49][0]).toBe('49');
+    expect(planRows()[49][4]).toBe('0'); // 后续全部已覆盖
+
+    const planSection = screen.getByText('5. 有序备纤计划复核').closest('section') as HTMLElement;
+    fireEvent.click(within(planSection).getByRole('button', { name: '下一页' }));
+    await waitFor(() => expect(planRows()).toHaveLength(10));
+    expect(planRows()[0][0]).toBe('50');
+    expect(planRows()[9][0]).toBe('59');
+    expect(planRows()[9][5]).toBe('2'); // 累计始终为 2
+    expect(planRows()[9][6]).toBe('0');
+    expect(within(planSection).getByText(/共 60 条/)).toBeTruthy();
+
+    // 批量筛选区独立存在
+    await submitBatch('[{"a":"a","b":"c"}]');
+    await waitFor(() => expect(batchRows()).toHaveLength(1));
+    expect(planStatValue('计划步骤总数')).toBe('60');
   });
 });

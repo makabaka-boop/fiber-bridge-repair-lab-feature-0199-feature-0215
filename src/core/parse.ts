@@ -4,13 +4,21 @@
  * 仅接受普通 JSON 基础类型；所有错误均以 TopologyError 抛出中文消息，
  * 由 UI 保留上次有效拓扑并显示。
  */
-import { TopologyError, type BatchPair, type NormalizedLink, type NormalizedTopology } from './types';
+import {
+  TopologyError,
+  type BatchPair,
+  type NormalizedLink,
+  type NormalizedTopology,
+  type OrderedPlanStep,
+} from './types';
 
 export const MAX_SITES = 200_000;
 export const MAX_LINKS = 400_000;
 export const MIN_SITES = 2;
 /** 批量方案筛选：单次导入的端点对数量上限 */
 export const MAX_BATCH_PAIRS = 100_000;
+/** 有序备纤计划：单次导入的步骤数量上限（与批量筛选相同） */
+export const MAX_PLAN_STEPS = 100_000;
 
 /**
  * 将一个 JSON 值规范化为非空字符串编号。
@@ -133,7 +141,7 @@ export function parseTopology(jsonText: string): NormalizedTopology {
  * 或安全整数按其十进制文本承载；其余类型（布尔、null、对象、数组、
  * NaN/Infinity）一律拒绝。
  */
-function normalizeBatchEndpoint(value: unknown, label: string): string {
+export function normalizePairEndpoint(value: unknown, label: string): string {
   if (typeof value === 'string') {
     const s = value.trim();
     if (s.length === 0) {
@@ -148,14 +156,13 @@ function normalizeBatchEndpoint(value: unknown, label: string): string {
 }
 
 /**
- * 解析批量方案筛选输入：一个 1–100000 项的 JSON 数组，每项为**仅含**
- * "a"、"b" 两个字段的对象（端点编号沿用单次试接规则）。
+ * “仅含 a/b 两字段对象”的 JSON 数组解析，批量方案筛选与有序备纤计划共用
+ * 同一份契约：1–maxCount 项，每项端点编号沿用单次试接规则。
  *
- * 仅做结构与字段校验；端点存在性、互异性由 Analyzer.screenBatch
- * 针对当前拓扑校验。空批次、额外字段、超限、任一项非法均整体拒绝，
- * 错误消息携带输入下标（0 起）。
+ * 仅做结构与字段校验；端点存在性、互异性由 Analyzer 针对当前拓扑校验。
+ * 空数组、额外字段、超限、任一项非法均整体拒绝，错误消息携带输入下标（0 起）。
  */
-export function parseBatchPlans(jsonText: string): BatchPair[] {
+function parsePairArray(jsonText: string, kind: string, maxCount: number): BatchPair[] {
   let raw: unknown;
   try {
     raw = JSON.parse(jsonText);
@@ -163,18 +170,18 @@ export function parseBatchPlans(jsonText: string): BatchPair[] {
     throw new TopologyError(`JSON 语法错误：${(e as Error).message}`);
   }
   if (!Array.isArray(raw)) {
-    throw new TopologyError('批量方案必须是一个 JSON 数组，形如 [{"a": "站点1", "b": "站点2"}, ...]');
+    throw new TopologyError(`${kind}必须是一个 JSON 数组，形如 [{"a": "站点1", "b": "站点2"}, ...]`);
   }
   if (raw.length === 0) {
-    throw new TopologyError('批量方案不能为空数组：至少包含 1 项端点对');
+    throw new TopologyError(`${kind}不能为空数组：至少包含 1 项端点对`);
   }
-  if (raw.length > MAX_BATCH_PAIRS) {
-    throw new TopologyError(`批量方案项数超过上限 ${MAX_BATCH_PAIRS}，当前为 ${raw.length}`);
+  if (raw.length > maxCount) {
+    throw new TopologyError(`${kind}项数超过上限 ${maxCount}，当前为 ${raw.length}`);
   }
 
   const pairs: BatchPair[] = new Array(raw.length);
   for (let i = 0; i < raw.length; i++) {
-    const where = `批量方案下标 ${i}`;
+    const where = `${kind}下标 ${i}`;
     const entry = raw[i];
     if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
       throw new TopologyError(`${where}：每项必须是仅含 "a"、"b" 两个字段的对象`);
@@ -187,11 +194,32 @@ export function parseBatchPlans(jsonText: string): BatchPair[] {
       throw new TopologyError(`${where}：每项仅允许 "a"、"b" 两个字段，发现额外字段 ${JSON.stringify(extra[0])}`);
     }
     pairs[i] = {
-      a: normalizeBatchEndpoint(obj.a, `${where} 的端点 a`),
-      b: normalizeBatchEndpoint(obj.b, `${where} 的端点 b`),
+      a: normalizePairEndpoint(obj.a, `${where} 的端点 a`),
+      b: normalizePairEndpoint(obj.b, `${where} 的端点 b`),
     };
   }
   return pairs;
+}
+
+/**
+ * 解析批量方案筛选输入：一个 1–100000 项的 JSON 数组，每项为**仅含**
+ * "a"、"b" 两个字段的对象（端点编号沿用单次试接规则）。
+ *
+ * 仅做结构与字段校验；端点存在性、互异性由 Analyzer.screenBatch
+ * 针对当前拓扑校验。空批次、额外字段、超限、任一项非法均整体拒绝，
+ * 错误消息携带输入下标（0 起）。
+ */
+export function parseBatchPlans(jsonText: string): BatchPair[] {
+  return parsePairArray(jsonText, '批量方案', MAX_BATCH_PAIRS);
+}
+
+/**
+ * 解析有序备纤计划输入：与批量方案筛选完全相同的 1–100000 项 a/b 数组契约，
+ * 区别仅在于步骤顺序决定桥的归属（同一桥只归最早覆盖它的步骤）。
+ * 端点存在性、互异性由 Analyzer.reviewOrderedPlan 针对当前拓扑校验。
+ */
+export function parseOrderedPlan(jsonText: string): OrderedPlanStep[] {
+  return parsePairArray(jsonText, '有序备纤计划', MAX_PLAN_STEPS);
 }
 
 /** 连通性检查（显式栈迭代，避免深递归） */

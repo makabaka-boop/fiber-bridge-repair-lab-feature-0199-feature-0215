@@ -1,8 +1,14 @@
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import { Analyzer } from '../core/analysis';
-import { parseBatchPlans, parseTopology } from '../core/parse';
+import { parseBatchPlans, parseOrderedPlan, parseTopology } from '../core/parse';
 import { TopologyError } from '../core/types';
-import type { BaselineResult, BatchScreenResult, NormalizedTopology, TrialResult } from '../core/types';
+import type {
+  BaselineResult,
+  BatchScreenResult,
+  NormalizedTopology,
+  OrderedPlanResult,
+  TrialResult,
+} from '../core/types';
 import { sampleTopology } from './sample';
 import { BridgeTable, Pagination, usePagination } from './BridgeTable';
 
@@ -28,6 +34,13 @@ interface BatchState {
   error: string | null;
 }
 
+interface PlanState {
+  /** 上次成功的有序备纤计划复核结果；非法导入时保留不变（草稿文本由输入区自管） */
+  result: OrderedPlanResult | null;
+  error: string | null;
+  reviewing: boolean;
+}
+
 export function App() {
   const [valid, setValid] = useState<ValidState | null>(null);
   const [rawText, setRawText] = useState('');
@@ -37,6 +50,9 @@ export function App() {
 
   const [trial, setTrial] = useState<TrialState | null>(null);
   const [batch, setBatch] = useState<BatchState | null>(null);
+  const [plan, setPlan] = useState<PlanState | null>(null);
+  /** 拓扑代次：每次成功导入递增，作废在途的异步复核回调，防止旧拓扑结果复活 */
+  const topologyRev = useRef(0);
 
   const loadTopology = useCallback((text: string, label: string | null) => {
     setImporting(true);
@@ -45,6 +61,7 @@ export function App() {
       try {
         const topology = parseTopology(text);
         const analyzer = new Analyzer(topology);
+        topologyRev.current++; // 新拓扑生效：作废此前所有在途计划复核
         setValid({
           topology,
           analyzer,
@@ -53,9 +70,10 @@ export function App() {
         });
         setImportError(null);
         setFileName(label);
-        // 新拓扑导入后旧试接与旧批量结果不再适用，清空（基线本身不受历史操作影响）
+        // 新拓扑导入后旧试接、旧批量与旧有序计划结果不再适用，清空（基线本身不受历史操作影响）
         setTrial(null);
         setBatch(null);
+        setPlan(null);
       } catch (e) {
         const msg = e instanceof TopologyError ? e.message : `分析失败：${(e as Error).message}`;
         setImportError(msg); // 保留 valid（上次有效拓扑）与既有试接/批量结果不变
@@ -109,6 +127,34 @@ export function App() {
       // 非法批量导入：保留上次批量结果（若有），仅更新错误
       setBatch((prev) => ({ result: prev?.result ?? null, error: msg }));
     }
+  };
+
+  const onPlan = (text: string) => {
+    if (!valid || plan?.reviewing) return;
+    const rev = topologyRev.current;
+    const analyzer = valid.analyzer;
+    setPlan((prev) => ({ result: prev?.result ?? null, error: prev?.error ?? null, reviewing: true }));
+    // 让出一帧以展示“复核中”，避免 100000 步大计划时长时间无反馈
+    setTimeout(() => {
+      // 期间若已导入新拓扑（代次变化），本次结果一律作废
+      if (rev !== topologyRev.current) return;
+      try {
+        // 全批校验（结构/字段 → 端点存在且互异）通过后才计算；计算完成才原子替换
+        const steps = parseOrderedPlan(text);
+        const result = analyzer.reviewOrderedPlan(steps);
+        setPlan((prev) =>
+          rev === topologyRev.current ? { result, error: null, reviewing: false } : prev,
+        );
+      } catch (e) {
+        const msg = e instanceof TopologyError ? e.message : `有序备纤计划复核失败：${(e as Error).message}`;
+        // 非法计划：保留上次成功结果（若有）与草稿，仅更新错误
+        setPlan((prev) =>
+          rev === topologyRev.current
+            ? { result: prev?.result ?? null, error: msg, reviewing: false }
+            : prev,
+        );
+      }
+    }, 0);
   };
 
   return (
@@ -189,6 +235,11 @@ export function App() {
             batch={batch}
             onSubmit={onBatch}
             onDismissError={() => setBatch((p) => (p ? { ...p, error: null } : p))}
+          />
+          <OrderedPlanSection
+            plan={plan}
+            onSubmit={onPlan}
+            onDismissError={() => setPlan((p) => (p ? { ...p, error: null } : p))}
           />
         </>
       )}
@@ -428,6 +479,148 @@ function BatchSection({
                     <td className="num strong">{it.removedCount.toLocaleString('zh-CN')}</td>
                   </tr>
                 ))}
+              </tbody>
+            </table>
+          </div>
+          <Pagination page={page} total={result.items.length} />
+        </div>
+      )}
+    </section>
+  );
+}
+
+function OrderedPlanSection({
+  plan,
+  onSubmit,
+  onDismissError,
+}: {
+  plan: PlanState | null;
+  onSubmit: (text: string) => void;
+  onDismissError: () => void;
+}) {
+  const [text, setText] = useState('');
+  const [expanded, setExpanded] = useState<Set<number>>(new Set());
+
+  // 仅当存在上次成功结果时展示；非法计划时 result 保持为上次结果（草稿文本不动）
+  const result = plan?.result ?? null;
+  const reviewing = plan?.reviewing ?? false;
+  const page = usePagination(result?.items.length ?? 0, 'plan');
+  const slice = useMemo(
+    () => result?.items.slice(page.start, page.end) ?? [],
+    [result, page.start, page.end],
+  );
+  const zeroSteps = useMemo(() => result?.items.filter((it) => it.marginal === 0).length ?? 0, [result]);
+
+  const toggle = (index: number) => {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(index)) next.delete(index);
+      else next.add(index);
+      return next;
+    });
+  };
+
+  return (
+    <section className="card">
+      <h2>5. 有序备纤计划复核</h2>
+      <p className="hint">
+        粘贴 1–100000 项的 JSON 数组，每项仅含 <code>{'{"a": "站点1", "b": "站点2"}'}</code> 两个字段，
+        <strong>数组顺序即施工顺序</strong>。按顺序给出每一步的端点对、<strong>本步首次消除</strong>的基线桥清单
+        （按链路编号 UTF-8 字节序）、边际数、累计数与剩余数；同一桥只归最早覆盖它的步骤，
+        重复、反向、交叠或包含路径的后续步骤边际可为 0。全批校验通过、计算完成后才整体替换；
+        零项空批次、超过 100000 步、出现 <code>a</code>/<code>b</code> 以外的字段、
+        端点不存在或两端相同均整批拒绝并指出<strong>零起下标</strong>，不产生部分结果。
+      </p>
+      <textarea
+        className="json-input"
+        aria-label="有序备纤计划 JSON 输入"
+        rows={5}
+        placeholder='[{"a":"a","b":"f"}, {"a":"c","b":"h"}, ...]'
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        spellCheck={false}
+      />
+      <div className="row">
+        <button className="primary" onClick={() => onSubmit(text)} disabled={reviewing}>
+          {reviewing ? '复核中…' : '按序复核'}
+        </button>
+      </div>
+
+      {plan?.error && (
+        <div className="alert error" role="alert">
+          <strong>有序备纤计划被拒绝。</strong> {result ? '上次成功结果保留如下。' : '尚无成功复核结果。'}
+          <div className="alert-detail">{plan.error}</div>
+          <button className="link" onClick={onDismissError}>
+            关闭提示
+          </button>
+        </div>
+      )}
+
+      {result && (
+        <div className="plan-result">
+          <div className="stat-row">
+            <Stat label="计划步骤总数" value={result.items.length} />
+            <Stat label="计划覆盖基线桥" value={result.coveredCount} />
+            <Stat label="基线脆弱链路总数" value={result.baselineCount} />
+            <Stat label="零边际步骤数" value={zeroSteps} />
+            <Stat label="计划后仍剩余" value={result.baselineCount - result.coveredCount} />
+          </div>
+          <div className="table-wrap">
+            <table className="bridge-table plan-table">
+              <thead>
+                <tr>
+                  <th className="col-rank">步骤</th>
+                  <th className="col-endpoint">端点 A</th>
+                  <th className="col-endpoint">端点 B</th>
+                  <th>本步首次消除的基线桥（UTF-8 字节序）</th>
+                  <th className="col-side">边际数</th>
+                  <th className="col-side">累计数</th>
+                  <th className="col-side">剩余数</th>
+                </tr>
+              </thead>
+              <tbody>
+                {slice.map((it) => {
+                  const open = expanded.has(it.index);
+                  const preview = it.firstRemoved.slice(0, 8).map((b) => b.id).join('、');
+                  return (
+                    <tr key={it.index} className={it.marginal === 0 ? 'zero-step' : ''}>
+                      <td className="muted">{it.index}</td>
+                      <td className="mono">{it.a}</td>
+                      <td className="mono">{it.b}</td>
+                      <td>
+                        {it.firstRemoved.length === 0 ? (
+                          <span className="muted">无（0）</span>
+                        ) : (
+                          <div className="bridge-cell">
+                            <span className="mono bridge-preview">{open ? '' : preview}</span>
+                            {!open && it.firstRemoved.length > 8 && (
+                              <span className="muted"> …等 {it.firstRemoved.length} 条</span>
+                            )}
+                            {open && (
+                              <ul className="bridge-list">
+                                {it.firstRemoved.map((b) => (
+                                  <li key={b.id} className="mono">
+                                    {b.id}
+                                    <span className="muted">
+                                      {' '}
+                                      （{b.u} <span className="dash">–</span> {b.v}）
+                                    </span>
+                                  </li>
+                                ))}
+                              </ul>
+                            )}
+                            <button className="link expand-btn" onClick={() => toggle(it.index)}>
+                              {open ? '收起清单' : `展开清单（${it.firstRemoved.length}）`}
+                            </button>
+                          </div>
+                        )}
+                      </td>
+                      <td className="num strong">{it.marginal.toLocaleString('zh-CN')}</td>
+                      <td className="num">{it.cumulative.toLocaleString('zh-CN')}</td>
+                      <td className="num">{it.remaining.toLocaleString('zh-CN')}</td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>

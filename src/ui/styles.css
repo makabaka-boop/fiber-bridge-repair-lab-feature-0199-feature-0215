@@ -375,6 +375,45 @@ h3.removed {
   padding: 40px 20px;
 }
 
+/* 有序备纤计划复核 */
+.plan-table td,
+.plan-table th {
+  white-space: normal;
+  vertical-align: top;
+}
+
+.plan-table tbody tr.zero-step {
+  color: var(--muted);
+}
+
+.plan-table tbody tr.zero-step .strong {
+  color: var(--muted);
+}
+
+.bridge-cell {
+  min-width: 220px;
+}
+
+.bridge-preview {
+  font-size: 12.5px;
+  color: var(--text);
+  word-break: break-all;
+}
+
+.bridge-list {
+  margin: 4px 0;
+  padding-left: 18px;
+  max-height: 260px;
+  overflow-y: auto;
+  line-height: 1.8;
+}
+
+.expand-btn {
+  display: inline-block;
+  margin-top: 2px;
+  font-size: 12px;
+}
+
 .footer {
   text-align: center;
   color: var(--muted);

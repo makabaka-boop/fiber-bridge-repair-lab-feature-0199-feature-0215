@@ -72,6 +72,38 @@ export interface BatchScreenResult {
   baselineCount: number;
 }
 
+/** 有序备纤计划中的一步（与批量方案同样的端点对，但步骤顺序有意义） */
+export interface OrderedPlanStep {
+  a: string;
+  b: string;
+}
+
+/** 有序备纤计划复核中的一步结论：同一桥只归最早覆盖它的步骤 */
+export interface OrderedPlanItem {
+  /** 步骤下标（0 起），即计划中的施工顺序 */
+  index: number;
+  a: string;
+  b: string;
+  /** 本步首次消除的基线桥（此前各步均未覆盖），按链路编号 UTF-8 字节序 */
+  firstRemoved: BridgeInfo[];
+  /** 边际数：本步首次消除的桥数（重复/反向/交叠/包含路径的后续步骤可为 0） */
+  marginal: number;
+  /** 累计数：截至本步（含）已消除的桥数 */
+  cumulative: number;
+  /** 剩余数：本步之后计划尚未覆盖的基线桥数 */
+  remaining: number;
+}
+
+/** 有序备纤计划整体复核结果：全批校验通过、计算完成后原子替换 */
+export interface OrderedPlanResult {
+  /** 按计划顺序排列，长度与输入一致 */
+  items: OrderedPlanItem[];
+  /** 生成结果时的基线脆弱链路总数（快照） */
+  baselineCount: number;
+  /** 计划覆盖的基线桥总数（= 末步累计数，= 各步清单并集大小） */
+  coveredCount: number;
+}
+
 /** 试接一条虚拟备纤后的结论 */
 export interface TrialResult {
   a: string;
